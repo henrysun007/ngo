@@ -3,6 +3,8 @@ INCLUDE_MAKEFILE := $(lastword $(MAKEFILE_LIST))
 CUR_DIR := $(shell dirname $(realpath $(MAIN_MAKEFILE)))
 PROJECT_DIR := $(realpath $(CUR_DIR)/../../)
 
+SHELL := /bin/bash
+
 SGX_SDK ?= /opt/intel/sgxsdk
 SGX_MODE ?= HW
 SGX_ARCH ?= x64
@@ -129,8 +131,11 @@ SGX_CXXFLAGS_T := $(SGX_CFLAGS_T) -std=c++11 -nostdinc++ -I$(SGX_SDK)/include/li
 #  only the libaries that are explictly specified on the command line are 
 #  linked.
 SGX_LFLAGS_T = $(SGX_COMMON_CFLAGS) -nostdlib -L$(SGX_LIBRARY_PATH) $(_Other_Link_Flags) \
-	-Wl,--whole-archive -l$(Trts_Library_Name) -Wl,--no-whole-archive \
-	-Wl,--start-group -lsgx_tcxx -lsgx_tstdc -l$(Crypto_Library_Name) -l$(Service_Library_Name) $(_Other_Enclave_Libs) -Wl,--end-group \
+	-Wl,--whole-archive -l$(Trts_Library_Name) -Wl,--no-whole-archive
+ifeq ($(TCMALLOC), Y)
+SGX_LFLAGS_T += -Wl,--whole-archive -lsgx_tcmalloc -Wl,--no-whole-archive
+endif
+SGX_LFLAGS_T += -Wl,--start-group -lsgx_tcxx -lsgx_tstdc -l$(Crypto_Library_Name) -l$(Service_Library_Name) $(_Other_Enclave_Libs) -Wl,--end-group \
 	-Wl,-Bstatic -Wl,-Bsymbolic -Wl,--no-undefined \
 	-Wl,-pie,-eenclave_entry -Wl,--export-dynamic  \
 	-Wl,--defsym,__ImageBase=0 \
@@ -140,14 +145,17 @@ SGX_LFLAGS_T = $(SGX_COMMON_CFLAGS) -nostdlib -L$(SGX_LIBRARY_PATH) $(_Other_Lin
 define format-rust
 	output=$$(cargo fmt -- --check 2>&1); retval=$$?; \
 		if [[ $$retval -eq 1 ]]; then \
-			$(ECHO) "$$output"; cargo fmt; $(ECHO) "$(GREEN)\nRust code format corrected.$(NO_COLOR)"; \
+			$(ECHO) "$$output"; \
+			cargo fmt; \
+			$(ECHO) "$(GREEN)\nRust code format corrected.$(NO_COLOR)"; \
 		fi
 endef
 
 define format-check-rust
 	output=$$(cargo fmt -- --check 2>&1); retval=$$?; \
 		if [[ $$retval -eq 1 ]]; then \
-			$(ECHO) "$(RED)\nSome format issues of Rust code are detected:$(NO_COLOR)"; $(ECHO) "\n$$output"; \
+			$(ECHO) "$(RED)\nSome format issues of Rust code are detected:$(NO_COLOR)"; \
+			$(ECHO) "\n$$output"; \
 			$(ECHO) "\nTo get rid of the format warnings above, run $(CYAN)"make format"$(NO_COLOR) to correct"; \
 		fi
 endef

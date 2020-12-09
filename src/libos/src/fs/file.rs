@@ -91,22 +91,50 @@ pub trait File: Debug + Sync + Send + Any {
         return_op_unsupported_error!("set_advisory_lock")
     }
 
+    // TODO: remove this function after all users of this code are removed
     fn poll(&self) -> Result<(crate::net::PollEventFlags)> {
         return_op_unsupported_error!("poll")
     }
 
+    // TODO: remove this function after all users of this code are removed
     fn enqueue_event(&self, _: crate::net::IoEvent) -> Result<()> {
         return_op_unsupported_error!("enqueue_event");
     }
 
+    // TODO: remove this function after all users of this code are removed
     fn dequeue_event(&self) -> Result<()> {
         return_op_unsupported_error!("dequeue_event");
     }
 
+    // TODO: rename poll_new to poll
+    fn poll_new(&self) -> IoEvents {
+        IoEvents::empty()
+    }
+
+    /// Returns a notifier that broadcast events on this file.
+    ///
+    /// Not every file has an associated event notifier.
+    fn notifier(&self) -> Option<&IoNotifier> {
+        None
+    }
+
+    /// Return the host fd, if the file is backed by an underlying host file.
+    fn host_fd(&self) -> Option<&HostFd> {
+        return None;
+    }
+
+    /// Update the ready events of a host file.
+    ///
+    /// After calling this method, the `poll` method of the `File` trait will
+    /// return the latest event state on the `HostFile`.
+    ///
+    /// This method has no effect if the `host_fd` method returns `None`.
+    fn update_host_events(&self, ready: &IoEvents, mask: &IoEvents, trigger_notifier: bool) {}
+
     fn as_any(&self) -> &dyn Any;
 }
 
-pub type FileRef = Arc<Box<dyn File>>;
+pub type FileRef = Arc<dyn File>;
 
 #[derive(Copy, Clone, Debug)]
 struct FileOpNotSupportedError {

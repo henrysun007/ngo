@@ -23,9 +23,9 @@ pub fn do_eventfd2(init_val: u32, flags: i32) -> Result<isize> {
 
     let inner_flags =
         EventCreationFlags::from_bits(flags).ok_or_else(|| errno!(EINVAL, "invalid flags"))?;
-    let file_ref: Arc<Box<dyn File>> = {
+    let file_ref: Arc<dyn File> = {
         let event = EventFile::new(init_val, inner_flags)?;
-        Arc::new(Box::new(event))
+        Arc::new(event)
     };
 
     let fd = current!().add_file(
@@ -248,6 +248,15 @@ pub fn do_getdents64(fd: FileDesc, buf: *mut u8, buf_size: usize) -> Result<isiz
     Ok(len as isize)
 }
 
+pub fn do_getdents(fd: FileDesc, buf: *mut u8, buf_size: usize) -> Result<isize> {
+    let safe_buf = {
+        from_user::check_mut_array(buf, buf_size)?;
+        unsafe { std::slice::from_raw_parts_mut(buf, buf_size) }
+    };
+    let len = file_ops::do_getdents(fd, safe_buf)?;
+    Ok(len as isize)
+}
+
 pub fn do_sync() -> Result<isize> {
     fs_ops::do_sync()?;
     Ok(0)
@@ -305,8 +314,7 @@ pub fn do_getcwd(buf_ptr: *mut u8, size: usize) -> Result<isize> {
     buf[..cwd.len()].copy_from_slice(cwd.as_bytes());
     buf[cwd.len()] = 0;
 
-    // getcwd requires returning buf_ptr if success
-    Ok(buf_ptr as isize)
+    Ok(buf.len() as isize)
 }
 
 pub fn do_rename(oldpath: *const i8, newpath: *const i8) -> Result<isize> {

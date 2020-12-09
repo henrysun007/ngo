@@ -27,7 +27,12 @@ jobs:
 
       - name: Get release version
         id: get_version
-        run: echo ::set-env name=RELEASE_VERSION::$(echo ${GITHUB_REF:10})
+        run: echo "RELEASE_VERSION=$(echo ${GITHUB_REF:10})" >> $GITHUB_ENV;
+
+      - name: Get branch name
+        # GITHUB_REF=refs/heads/branch-name
+        # ${GITHUB_REF##*/} == branch-name
+        run: echo "OCCLUM_BRANCH=$(echo ${GITHUB_REF##*/})" >> $GITHUB_ENV;
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v1
@@ -47,6 +52,7 @@ jobs:
           context: .
           file: ./tools/docker/Dockerfile.centos8.1
           platforms: linux/amd64
+          build-args: OCCLUM_BRANCH=${{ env.OCCLUM_BRANCH }}
           push: true
           tags: occlum/occlum:${{ env.RELEASE_VERSION }}-centos8.1
 
@@ -67,7 +73,12 @@ jobs:
 
       - name: Get release version
         id: get_version
-        run: echo ::set-env name=RELEASE_VERSION::$(echo ${GITHUB_REF:10})
+        run: echo "RELEASE_VERSION=$(echo ${GITHUB_REF:10})" >> $GITHUB_ENV;
+
+      - name: Get branch name
+        # GITHUB_REF=refs/heads/branch-name
+        # ${GITHUB_REF##*/} == branch-name
+        run: echo "OCCLUM_BRANCH=$(echo ${GITHUB_REF##*/})" >> $GITHUB_ENV;
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v1
@@ -87,5 +98,6 @@ jobs:
           context: .
           file: ./tools/docker/Dockerfile.ubuntu18.04
           platforms: linux/amd64
+          build-args: OCCLUM_BRANCH=${{ env.OCCLUM_BRANCH }}
           push: true
           tags: occlum/occlum:${{ env.RELEASE_VERSION }}-ubuntu18.04

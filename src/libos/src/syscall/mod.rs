@@ -24,12 +24,12 @@ use crate::exception::do_handle_exception;
 use crate::fs::{
     do_access, do_chdir, do_chmod, do_chown, do_close, do_dup, do_dup2, do_dup3, do_eventfd,
     do_eventfd2, do_faccessat, do_fchmod, do_fchmodat, do_fchown, do_fchownat, do_fcntl,
-    do_fdatasync, do_fstat, do_fstatat, do_fsync, do_ftruncate, do_getcwd, do_getdents64, do_ioctl,
-    do_lchown, do_link, do_linkat, do_lseek, do_lstat, do_mkdir, do_mkdirat, do_open, do_openat,
-    do_pipe, do_pipe2, do_pread, do_pwrite, do_read, do_readlink, do_readlinkat, do_readv,
-    do_rename, do_renameat, do_rmdir, do_sendfile, do_stat, do_symlink, do_symlinkat, do_sync,
-    do_truncate, do_unlink, do_unlinkat, do_write, do_writev, iovec_t, File, FileDesc, FileRef,
-    HostStdioFds, Stat,
+    do_fdatasync, do_fstat, do_fstatat, do_fsync, do_ftruncate, do_getcwd, do_getdents,
+    do_getdents64, do_ioctl, do_lchown, do_link, do_linkat, do_lseek, do_lstat, do_mkdir,
+    do_mkdirat, do_open, do_openat, do_pipe, do_pipe2, do_pread, do_pwrite, do_read, do_readlink,
+    do_readlinkat, do_readv, do_rename, do_renameat, do_rmdir, do_sendfile, do_stat, do_symlink,
+    do_symlinkat, do_sync, do_truncate, do_unlink, do_unlinkat, do_write, do_writev, iovec_t, File,
+    FileDesc, FileRef, HostStdioFds, Stat,
 };
 use crate::interrupt::{do_handle_interrupt, sgx_interrupt_info_t};
 use crate::misc::{resource_t, rlimit_t, sysinfo_t, utsname_t};
@@ -37,7 +37,7 @@ use crate::net::{
     do_accept, do_accept4, do_bind, do_connect, do_epoll_create, do_epoll_create1, do_epoll_ctl,
     do_epoll_pwait, do_epoll_wait, do_getpeername, do_getsockname, do_getsockopt, do_listen,
     do_poll, do_recvfrom, do_recvmsg, do_select, do_sendmsg, do_sendto, do_setsockopt, do_shutdown,
-    do_socket, do_socketpair, msghdr, msghdr_mut, PollEvent,
+    do_socket, do_socketpair, msghdr, msghdr_mut,
 };
 use crate::process::{
     do_arch_prctl, do_clone, do_exit, do_exit_group, do_futex, do_getegid, do_geteuid, do_getgid,
@@ -91,7 +91,7 @@ macro_rules! process_syscall_table_with_callback {
             (Stat = 4) => do_stat(path: *const i8, stat_buf: *mut Stat),
             (Fstat = 5) => do_fstat(fd: FileDesc, stat_buf: *mut Stat),
             (Lstat = 6) => do_lstat(path: *const i8, stat_buf: *mut Stat),
-            (Poll = 7) => do_poll(fds: *mut PollEvent, nfds: libc::nfds_t, timeout: c_int),
+            (Poll = 7) => do_poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout: c_int),
             (Lseek = 8) => do_lseek(fd: FileDesc, offset: off_t, whence: i32),
             (Mmap = 9) => do_mmap(addr: usize, size: usize, perms: i32, flags: i32, fd: FileDesc, offset: off_t),
             (Mprotect = 10) => do_mprotect(addr: usize, len: usize, prot: u32),
@@ -162,7 +162,7 @@ macro_rules! process_syscall_table_with_callback {
             (Fdatasync = 75) => do_fdatasync(fd: FileDesc),
             (Truncate = 76) => do_truncate(path: *const i8, len: usize),
             (Ftruncate = 77) => do_ftruncate(fd: FileDesc, len: usize),
-            (Getdents = 78) => handle_unsupported(),
+            (Getdents = 78) => do_getdents(fd: FileDesc, buf: *mut u8, buf_size: usize),
             (Getcwd = 79) => do_getcwd(buf: *mut u8, size: usize),
             (Chdir = 80) => do_chdir(path: *const i8),
             (Fchdir = 81) => handle_unsupported(),
@@ -286,7 +286,7 @@ macro_rules! process_syscall_table_with_callback {
             (Fremovexattr = 199) => handle_unsupported(),
             (Tkill = 200) => do_tkill(tid: pid_t, sig: c_int),
             (Time = 201) => handle_unsupported(),
-            (Futex = 202) => do_futex(futex_addr: *const i32, futex_op: u32, futex_val: i32, timeout: u64, futex_new_addr: *const i32),
+            (Futex = 202) => do_futex(futex_addr: *const i32, futex_op: u32, futex_val: i32, timeout: u64, futex_new_addr: *const i32, bitset: u32),
             (SchedSetaffinity = 203) => do_sched_setaffinity(pid: pid_t, cpusize: size_t, buf: *const c_uchar),
             (SchedGetaffinity = 204) => do_sched_getaffinity(pid: pid_t, cpusize: size_t, buf: *mut c_uchar),
             (SetThreadArea = 205) => handle_unsupported(),
@@ -908,11 +908,11 @@ pub struct FpRegs {
 impl FpRegs {
     /// Save the current CPU floating pointer states to an instance of FpRegs
     pub fn save() -> Self {
-        let mut fpregs = FpRegs {
-            inner: Aligned([0u8; 512]),
-        };
-        unsafe { _fxsave(fpregs.inner.as_mut_ptr()) };
-        fpregs
+        let mut fpregs = MaybeUninit::<Self>::uninit();
+        unsafe {
+            _fxsave(fpregs.as_mut_ptr() as *mut u8);
+            fpregs.assume_init()
+        }
     }
 
     /// Restore the current CPU floating pointer states from this FpRegs instance

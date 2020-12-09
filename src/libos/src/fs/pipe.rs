@@ -96,6 +96,14 @@ impl File for PipeReader {
         Ok(events)
     }
 
+    fn poll_new(&self) -> IoEvents {
+        self.consumer.poll()
+    }
+
+    fn notifier(&self) -> Option<&IoNotifier> {
+        Some(self.consumer.notifier())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -171,6 +179,14 @@ impl File for PipeWriter {
         Ok(events)
     }
 
+    fn poll_new(&self) -> IoEvents {
+        self.producer.poll()
+    }
+
+    fn notifier(&self) -> Option<&IoNotifier> {
+        Some(self.producer.notifier())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -204,8 +220,8 @@ pub fn do_pipe2(flags: u32) -> Result<[FileDesc; 2]> {
     let close_on_spawn = creation_flags.must_close_on_spawn();
 
     let current = current!();
-    let reader_fd = current.add_file(Arc::new(Box::new(pipe_reader)), close_on_spawn);
-    let writer_fd = current.add_file(Arc::new(Box::new(pipe_writer)), close_on_spawn);
+    let reader_fd = current.add_file(Arc::new(pipe_reader), close_on_spawn);
+    let writer_fd = current.add_file(Arc::new(pipe_writer), close_on_spawn);
     trace!("pipe2: reader_fd: {}, writer_fd: {}", reader_fd, writer_fd);
     Ok([reader_fd, writer_fd])
 }

@@ -21,17 +21,24 @@ impl<I> Channel<I> {
 
         let rb = RingBuffer::new(capacity);
         let (rb_producer, rb_consumer) = rb.split();
-        let producer = Producer::new(rb_producer, state.clone());
-        let consumer = Consumer::new(rb_consumer, state.clone());
+        let mut producer = Producer::new(rb_producer, state.clone());
+        let mut consumer = Consumer::new(rb_consumer, state.clone());
 
-        // Make event connection between the producer and consumer
-        producer.notifier().register(
-            Arc::downgrade(&consumer.observer) as Weak<dyn Observer<_>>,
+        // The events on an endpoint is not triggered by itself, but its peer.
+        // For example, a producer becomes writable (IoEvents::OUT) only if
+        // its peer consumer gets read. So an endpoint needs to hold a
+        // reference to the notifier of its peer.
+        producer.peer_notifier = Arc::downgrade(&consumer.notifier);
+        consumer.peer_notifier = Arc::downgrade(&producer.notifier);
+        // An endpoint registers itself as an observer to its own notifier so
+        // that it can be waken up by its peer.
+        producer.notifier.register(
+            Arc::downgrade(&producer.observer) as Weak<dyn Observer<_>>,
             None,
             None,
         );
-        consumer.notifier().register(
-            Arc::downgrade(&producer.observer) as Weak<dyn Observer<_>>,
+        consumer.notifier.register(
+            Arc::downgrade(&consumer.observer) as Weak<dyn Observer<_>>,
             None,
             None,
         );
@@ -83,85 +90,71 @@ impl<I: Copy> Channel<I> {
     }
 }
 
-/// An endpoint is either the producer or consumer of a channel.
-pub struct EndPoint<T> {
-    inner: SgxMutex<T>,
-    state: Arc<State>,
-    observer: Arc<WaiterQueueObserver<IoEvents>>,
-    notifier: IoNotifier,
-    is_nonblocking: AtomicBool,
-}
-
-impl<T> EndPoint<T> {
-    fn new(inner: T, state: Arc<State>) -> Self {
-        let inner = SgxMutex::new(inner);
-        let observer = WaiterQueueObserver::new();
-        let notifier = IoNotifier::new();
-        let is_nonblocking = AtomicBool::new(false);
-        Self {
-            inner,
-            state,
-            observer,
-            notifier,
-            is_nonblocking,
+// A macro to implemennt the common part of the two end point types, Producer<I>
+// and Consumer<I>.
+macro_rules! impl_end_point_type {
+    ($(#[$attr:meta])* $vis:vis struct $end_point:ident<$i:ident> {
+        inner: $inner:ident<$_:ident>,
+    }) => (
+        /// An endpoint is either the producer or consumer of a channel.
+        $(#[$attr])* $vis struct $end_point<$i> {
+            inner: SgxMutex<$inner<$i>>,
+            state: Arc<State>,
+            observer: Arc<WaiterQueueObserver<IoEvents>>,
+            notifier: Arc<IoNotifier>,
+            peer_notifier: Weak<IoNotifier>,
+            is_nonblocking: AtomicBool,
         }
-    }
 
-    /// Returns the I/O notifier.
-    ///
-    /// An interesting observer can receive I/O events of the endpoint by
-    /// registering itself to this notifier.
-    pub fn notifier(&self) -> &IoNotifier {
-        &self.notifier
-    }
+        impl<$i> $end_point<$i> {
+            fn new(inner: $inner<$i>, state: Arc<State>) -> Self {
+                let inner = SgxMutex::new(inner);
+                let observer = WaiterQueueObserver::new();
+                let notifier = Arc::new(IoNotifier::new());
+                let peer_notifier = Default::default();
+                let is_nonblocking = AtomicBool::new(false);
+                Self {
+                    inner,
+                    state,
+                    observer,
+                    notifier,
+                    peer_notifier,
+                    is_nonblocking,
+                }
+            }
 
-    /// Returns whether the endpoint is non-blocking.
-    ///
-    /// By default, a channel is blocking.
-    pub fn is_nonblocking(&self) -> bool {
-        self.is_nonblocking.load(Ordering::Acquire)
-    }
+            /// Returns the I/O notifier.
+            ///
+            /// An interesting observer can receive I/O events of the endpoint by
+            /// registering itself to this notifier.
+            pub fn notifier(&self) -> &IoNotifier {
+                &self.notifier
+            }
 
-    /// Set whether the endpoint is non-blocking.
-    pub fn set_nonblocking(&self, nonblocking: bool) {
-        self.is_nonblocking.store(nonblocking, Ordering::Release);
+            /// Returns whether the endpoint is non-blocking.
+            ///
+            /// By default, a channel is blocking.
+            pub fn is_nonblocking(&self) -> bool {
+                self.is_nonblocking.load(Ordering::Acquire)
+            }
 
-        if nonblocking {
-            // Wake all threads that are blocked on pushing/popping this endpoint
-            self.observer.waiter_queue().dequeue_and_wake_all();
+            /// Set whether the endpoint is non-blocking.
+            pub fn set_nonblocking(&self, nonblocking: bool) {
+                self.is_nonblocking.store(nonblocking, Ordering::Release);
+
+                if nonblocking {
+                    // Wake all threads that are blocked on pushing/popping this endpoint
+                    self.observer.waiter_queue().dequeue_and_wake_all();
+                }
+            }
+
+            fn trigger_peer_events(&self, events: &IoEvents) {
+                if let Some(peer_notifier) = self.peer_notifier.upgrade() {
+                    peer_notifier.broadcast(events);
+                }
+            }
         }
-    }
-}
-
-/// The state of a channel shared by the two endpoints of a channel.
-struct State {
-    is_producer_shutdown: AtomicBool,
-    is_consumer_shutdown: AtomicBool,
-}
-
-impl State {
-    pub fn new() -> Self {
-        Self {
-            is_producer_shutdown: AtomicBool::new(false),
-            is_consumer_shutdown: AtomicBool::new(false),
-        }
-    }
-
-    pub fn is_producer_shutdown(&self) -> bool {
-        self.is_producer_shutdown.load(Ordering::Acquire)
-    }
-
-    pub fn is_consumer_shutdown(&self) -> bool {
-        self.is_consumer_shutdown.load(Ordering::Acquire)
-    }
-
-    pub fn set_producer_shutdown(&self) {
-        self.is_producer_shutdown.store(true, Ordering::Release)
-    }
-
-    pub fn set_consumer_shutdown(&self) {
-        self.is_consumer_shutdown.store(true, Ordering::Release)
-    }
+    )
 }
 
 // Just like a normal loop, except that a waiter queue (as well as a waiter)
@@ -190,8 +183,12 @@ macro_rules! waiter_loop {
     };
 }
 
-/// Producer is the writable endpoint of a channel.
-pub type Producer<I> = EndPoint<RbProducer<I>>;
+impl_end_point_type! {
+    /// Producer is the writable endpoint of a channel.
+    pub struct Producer<I> {
+        inner: RbProducer<I>,
+    }
+}
 
 impl<I> Producer<I> {
     pub fn push(&self, mut item: I) -> Result<()> {
@@ -205,7 +202,7 @@ impl<I> Producer<I> {
                 item = match rb_producer.push(item) {
                     Ok(()) => {
                         drop(rb_producer);
-                        self.notifier.broadcast(&IoEvents::IN);
+                        self.trigger_peer_events(&IoEvents::IN);
                         return Ok(());
                     }
                     Err(item) => item,
@@ -244,11 +241,14 @@ impl<I> Producer<I> {
         {
             // It is important to hold this lock while updating the state
             let inner = self.inner.lock().unwrap();
+            if self.state.is_producer_shutdown() {
+                return;
+            }
             self.state.set_producer_shutdown();
         }
 
-        // Notify all consumers and other observers
-        self.notifier.broadcast(&IoEvents::HUP);
+        // The shutdown of the producer triggers hangup events on the consumer
+        self.trigger_peer_events(&IoEvents::HUP);
         // Wake all threads that are blocked on pushing to this producer
         self.observer.waiter_queue().dequeue_and_wake_all();
     }
@@ -264,6 +264,10 @@ impl<I> Producer<I> {
 
 impl<I: Copy> Producer<I> {
     pub fn push_slice(&self, items: &[I]) -> Result<usize> {
+        if items.len() == 0 {
+            return Ok(0);
+        }
+
         waiter_loop!(
             {
                 let mut rb_producer = self.inner.lock().unwrap();
@@ -274,7 +278,7 @@ impl<I: Copy> Producer<I> {
                 let count = rb_producer.push_slice(items);
                 if count > 0 {
                     drop(rb_producer);
-                    self.notifier.broadcast(&IoEvents::IN);
+                    self.trigger_peer_events(&IoEvents::IN);
                     return Ok(count);
                 }
 
@@ -287,8 +291,18 @@ impl<I: Copy> Producer<I> {
     }
 }
 
-/// Consumer is the readable endpoint of a channel.
-pub type Consumer<I> = EndPoint<RbConsumer<I>>;
+impl<I> Drop for Producer<I> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl_end_point_type! {
+    /// Consumer is the readable endpoint of a channel.
+    pub struct Consumer<I> {
+        inner: RbConsumer<I>,
+    }
+}
 
 impl<I> Consumer<I> {
     pub fn pop(&self) -> Result<Option<I>> {
@@ -301,7 +315,7 @@ impl<I> Consumer<I> {
 
                 if let Some(item) = rb_consumer.pop() {
                     drop(rb_consumer);
-                    self.notifier.broadcast(&IoEvents::OUT);
+                    self.trigger_peer_events(&IoEvents::OUT);
                     return Ok(Some(item));
                 }
 
@@ -341,11 +355,14 @@ impl<I> Consumer<I> {
         {
             // It is important to hold this lock while updating the state
             let inner = self.inner.lock().unwrap();
+            if self.state.is_consumer_shutdown() {
+                return;
+            }
             self.state.set_consumer_shutdown();
         }
 
-        // Notify all producers and other observers
-        self.notifier.broadcast(&IoEvents::RDHUP);
+        // The consumer being shutdown triggers error on the producer
+        self.trigger_peer_events(&IoEvents::ERR);
         // Wake all threads that are blocked on popping from this consumer
         self.observer.waiter_queue().dequeue_and_wake_all();
     }
@@ -361,6 +378,10 @@ impl<I> Consumer<I> {
 
 impl<I: Copy> Consumer<I> {
     pub fn pop_slice(&self, items: &mut [I]) -> Result<usize> {
+        if items.len() == 0 {
+            return Ok(0);
+        }
+
         waiter_loop!(
             {
                 let mut rb_consumer = self.inner.lock().unwrap();
@@ -371,7 +392,7 @@ impl<I: Copy> Consumer<I> {
                 let count = rb_consumer.pop_slice(items);
                 if count > 0 {
                     drop(rb_consumer);
-                    self.notifier.broadcast(&IoEvents::OUT);
+                    self.trigger_peer_events(&IoEvents::OUT);
                     return Ok(count);
                 };
 
@@ -384,5 +405,42 @@ impl<I: Copy> Consumer<I> {
             },
             self.observer.waiter_queue()
         );
+    }
+}
+
+impl<I> Drop for Consumer<I> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// The state of a channel shared by the two endpoints of a channel.
+struct State {
+    is_producer_shutdown: AtomicBool,
+    is_consumer_shutdown: AtomicBool,
+}
+
+impl State {
+    pub fn new() -> Self {
+        Self {
+            is_producer_shutdown: AtomicBool::new(false),
+            is_consumer_shutdown: AtomicBool::new(false),
+        }
+    }
+
+    pub fn is_producer_shutdown(&self) -> bool {
+        self.is_producer_shutdown.load(Ordering::Acquire)
+    }
+
+    pub fn is_consumer_shutdown(&self) -> bool {
+        self.is_consumer_shutdown.load(Ordering::Acquire)
+    }
+
+    pub fn set_producer_shutdown(&self) {
+        self.is_producer_shutdown.store(true, Ordering::Release)
+    }
+
+    pub fn set_consumer_shutdown(&self) {
+        self.is_consumer_shutdown.store(true, Ordering::Release)
     }
 }

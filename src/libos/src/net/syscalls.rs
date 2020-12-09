@@ -1,6 +1,9 @@
 use super::*;
 
-use super::io_multiplexing::{AsEpollFile, EpollCtlCmd, EpollEventFlags, EpollFile, FdSetExt};
+use std::mem::MaybeUninit;
+use std::time::Duration;
+
+use super::io_multiplexing::{AsEpollFile, EpollCtl, EpollFile, EpollFlags, FdSetExt, PollFd};
 use fs::{CreationFlags, File, FileDesc, FileRef};
 use misc::resource_t;
 use process::Process;
@@ -13,14 +16,14 @@ pub fn do_socket(domain: c_int, socket_type: c_int, protocol: c_int) -> Result<i
     let file_flags = FileFlags::from_bits_truncate(socket_type);
     let sock_type = SocketType::try_from(socket_type & (!file_flags.bits()))?;
 
-    let file_ref: Arc<Box<dyn File>> = match sock_domain {
+    let file_ref: Arc<dyn File> = match sock_domain {
         AddressFamily::LOCAL => {
             let unix_socket = UnixSocketFile::new(socket_type, protocol)?;
-            Arc::new(Box::new(unix_socket))
+            Arc::new(unix_socket)
         }
         _ => {
             let socket = HostSocket::new(sock_domain, sock_type, file_flags, protocol)?;
-            Arc::new(Box::new(socket))
+            Arc::new(socket)
         }
     };
 
@@ -130,7 +133,7 @@ pub fn do_accept4(
     let file_ref = current!().file(fd as FileDesc)?;
     let new_fd = if let Ok(socket) = file_ref.as_host_socket() {
         let (new_socket_file, sock_addr_option) = socket.accept(file_flags)?;
-        let new_file_ref: Arc<Box<dyn File>> = Arc::new(Box::new(new_socket_file));
+        let new_file_ref: Arc<dyn File> = Arc::new(new_socket_file);
         let new_fd = current!().add_file(new_file_ref, close_on_spawn);
 
         if addr_set && sock_addr_option.is_some() {
@@ -150,7 +153,7 @@ pub fn do_accept4(
         }
         // TODO: handle addr
         let new_socket = unix_socket.accept()?;
-        let new_file_ref: Arc<Box<dyn File>> = Arc::new(Box::new(new_socket));
+        let new_file_ref: Arc<dyn File> = Arc::new(new_socket);
         current!().add_file(new_file_ref, false)
     } else {
         return_errno!(EBADF, "not a socket");
@@ -163,7 +166,7 @@ pub fn do_shutdown(fd: c_int, how: c_int) -> Result<isize> {
     debug!("shutdown: fd: {}, how: {}", fd, how);
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_host_socket() {
-        let ret = try_libc!(libc::ocall::shutdown(socket.host_fd(), how));
+        let ret = try_libc!(libc::ocall::shutdown(socket.raw_host_fd() as i32, how));
         Ok(ret as isize)
     } else {
         // TODO: support unix socket
@@ -185,7 +188,7 @@ pub fn do_setsockopt(
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_host_socket() {
         let ret = try_libc!(libc::ocall::setsockopt(
-            socket.host_fd(),
+            socket.raw_host_fd() as i32,
             level,
             optname,
             optval,
@@ -215,7 +218,7 @@ pub fn do_getsockopt(
     let socket = file_ref.as_host_socket()?;
 
     let ret = try_libc!(libc::ocall::getsockopt(
-        socket.host_fd(),
+        socket.raw_host_fd() as i32,
         level,
         optname,
         optval,
@@ -235,7 +238,11 @@ pub fn do_getpeername(
     );
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_host_socket() {
-        let ret = try_libc!(libc::ocall::getpeername(socket.host_fd(), addr, addr_len));
+        let ret = try_libc!(libc::ocall::getpeername(
+            socket.raw_host_fd() as i32,
+            addr,
+            addr_len
+        ));
         Ok(ret as isize)
     } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
         warn!("getpeername for unix socket is unimplemented");
@@ -259,7 +266,11 @@ pub fn do_getsockname(
     );
     let file_ref = current!().file(fd as FileDesc)?;
     if let Ok(socket) = file_ref.as_host_socket() {
-        let ret = try_libc!(libc::ocall::getsockname(socket.host_fd(), addr, addr_len));
+        let ret = try_libc!(libc::ocall::getsockname(
+            socket.raw_host_fd() as i32,
+            addr,
+            addr_len
+        ));
         Ok(ret as isize)
     } else if let Ok(unix_socket) = file_ref.as_unix_socket() {
         warn!("getsockname for unix socket is unimplemented");
@@ -385,8 +396,8 @@ pub fn do_socketpair(
 
         let current = current!();
         let mut files = current.files().lock().unwrap();
-        sock_pair[0] = files.put(Arc::new(Box::new(client_socket)), close_on_spawn);
-        sock_pair[1] = files.put(Arc::new(Box::new(server_socket)), close_on_spawn);
+        sock_pair[0] = files.put(Arc::new(client_socket), close_on_spawn);
+        sock_pair[1] = files.put(Arc::new(server_socket), close_on_spawn);
 
         debug!("socketpair: ({}, {})", sock_pair[0], sock_pair[1]);
         Ok(0)
@@ -519,57 +530,61 @@ pub fn do_select(
     exceptfds: *mut libc::fd_set,
     timeout: *mut timeval_t,
 ) -> Result<isize> {
-    // check arguments
-    let soft_rlimit_nofile = current!()
-        .rlimits()
-        .lock()
-        .unwrap()
-        .get(resource_t::RLIMIT_NOFILE)
-        .get_cur();
-    if nfds < 0 || nfds > libc::FD_SETSIZE as i32 || nfds as u64 > soft_rlimit_nofile {
-        return_errno!(
-            EINVAL,
-            "nfds is negative or exceeds the resource limit or FD_SETSIZE"
-        );
-    }
-
-    if !timeout.is_null() {
-        from_user::check_ptr(timeout)?;
-        unsafe {
-            (*timeout).validate()?;
+    let nfds = {
+        let soft_rlimit_nofile = current!()
+            .rlimits()
+            .lock()
+            .unwrap()
+            .get(resource_t::RLIMIT_NOFILE)
+            .get_cur();
+        if nfds < 0 || nfds > libc::FD_SETSIZE as i32 || nfds as u64 > soft_rlimit_nofile {
+            return_errno!(
+                EINVAL,
+                "nfds is negative or exceeds the resource limit or FD_SETSIZE"
+            );
         }
-    }
+        nfds as FileDesc
+    };
 
-    // Select handles empty set and null in the same way
-    // TODO: Elegently handle the empty fd_set without allocating redundant fd_set
-    let mut empty_set_for_read = libc::fd_set::new_empty();
-    let mut empty_set_for_write = libc::fd_set::new_empty();
-    let mut empty_set_for_except = libc::fd_set::new_empty();
+    let mut timeout_c = if !timeout.is_null() {
+        from_user::check_ptr(timeout)?;
+        let timeval = unsafe { &mut *timeout };
+        timeval.validate()?;
+        Some(timeval)
+    } else {
+        None
+    };
+    let mut timeout = timeout_c.as_ref().map(|timeout_c| timeout_c.as_duration());
 
     let readfds = if !readfds.is_null() {
         from_user::check_mut_ptr(readfds)?;
-        unsafe { &mut *readfds }
+        Some(unsafe { &mut *readfds })
     } else {
-        &mut empty_set_for_read
+        None
     };
     let writefds = if !writefds.is_null() {
         from_user::check_mut_ptr(writefds)?;
-        unsafe { &mut *writefds }
+        Some(unsafe { &mut *writefds })
     } else {
-        &mut empty_set_for_write
+        None
     };
     let exceptfds = if !exceptfds.is_null() {
         from_user::check_mut_ptr(exceptfds)?;
-        unsafe { &mut *exceptfds }
+        Some(unsafe { &mut *exceptfds })
     } else {
-        &mut empty_set_for_except
+        None
     };
 
-    let ret = io_multiplexing::select(nfds, readfds, writefds, exceptfds, timeout)?;
-    Ok(ret)
+    let ret = io_multiplexing::do_select(nfds, readfds, writefds, exceptfds, timeout.as_mut());
+
+    if let Some(timeout_c) = timeout_c {
+        *timeout_c = timeout.unwrap().into();
+    }
+
+    ret
 }
 
-pub fn do_poll(fds: *mut PollEvent, nfds: libc::nfds_t, timeout: c_int) -> Result<isize> {
+pub fn do_poll(fds: *mut libc::pollfd, nfds: libc::nfds_t, timeout_ms: c_int) -> Result<isize> {
     // It behaves like sleep when fds is null and nfds is zero.
     if !fds.is_null() || nfds != 0 {
         from_user::check_mut_array(fds, nfds as usize)?;
@@ -586,21 +601,24 @@ pub fn do_poll(fds: *mut PollEvent, nfds: libc::nfds_t, timeout: c_int) -> Resul
         return_errno!(EINVAL, "The nfds value exceeds the RLIMIT_NOFILE value.");
     }
 
-    let polls = unsafe { std::slice::from_raw_parts_mut(fds, nfds as usize) };
-    debug!("poll: {:?}, timeout: {}", polls, timeout);
+    let raw_poll_fds = unsafe { std::slice::from_raw_parts_mut(fds, nfds as usize) };
+    let poll_fds: Vec<PollFd> = raw_poll_fds
+        .iter()
+        .map(|raw| PollFd::from_raw(raw))
+        .collect();
 
-    let mut time_val = timeval_t::new(
-        ((timeout as u32) / 1000) as i64,
-        ((timeout as u32) % 1000 * 1000) as i64,
-    );
-    let tmp_to = if timeout == -1 {
-        std::ptr::null_mut()
+    let mut timeout = if timeout_ms >= 0 {
+        Some(Duration::from_millis(timeout_ms as u64))
     } else {
-        &mut time_val
+        None
     };
 
-    let n = io_multiplexing::do_poll(polls, tmp_to)?;
-    Ok(n as isize)
+    let count = io_multiplexing::do_poll_new(&poll_fds, timeout.as_mut())?;
+
+    for (raw_poll_fd, poll_fd) in raw_poll_fds.iter_mut().zip(poll_fds.iter()) {
+        raw_poll_fd.revents = poll_fd.revents().get().to_raw() as i16;
+    }
+    Ok(count as isize)
 }
 
 pub fn do_epoll_create(size: c_int) -> Result<isize> {
@@ -611,40 +629,53 @@ pub fn do_epoll_create(size: c_int) -> Result<isize> {
 }
 
 pub fn do_epoll_create1(raw_flags: c_int) -> Result<isize> {
+    debug!("epoll_create: raw_flags: {:?}", raw_flags);
+
     // Only O_CLOEXEC is valid
     let flags = CreationFlags::from_bits(raw_flags as u32)
         .ok_or_else(|| errno!(EINVAL, "invalid flags"))?
         & CreationFlags::O_CLOEXEC;
-    let epoll_file = io_multiplexing::EpollFile::new(flags)?;
-    let file_ref: Arc<Box<dyn File>> = Arc::new(Box::new(epoll_file));
+    let epoll_file: Arc<EpollFile> = EpollFile::new();
     let close_on_spawn = flags.contains(CreationFlags::O_CLOEXEC);
-    let fd = current!().add_file(file_ref, close_on_spawn);
-
-    Ok(fd as isize)
+    let epfd = current!().add_file(epoll_file, close_on_spawn);
+    Ok(epfd as isize)
 }
 
 pub fn do_epoll_ctl(
     epfd: c_int,
     op: c_int,
     fd: c_int,
-    event: *const libc::epoll_event,
+    event_ptr: *const libc::epoll_event,
 ) -> Result<isize> {
     debug!("epoll_ctl: epfd: {}, op: {:?}, fd: {}", epfd, op, fd);
-    let inner_event = if !event.is_null() {
-        from_user::check_ptr(event)?;
-        Some(EpollEvent::from_raw(unsafe { &*event })?)
-    } else {
-        None
+
+    let get_c_event = |event_ptr| -> Result<&libc::epoll_event> {
+        from_user::check_ptr(event_ptr)?;
+        Ok(unsafe { &*event_ptr })
+    };
+
+    let fd = fd as FileDesc;
+    let ctl_cmd = match op {
+        libc::EPOLL_CTL_ADD => {
+            let c_event = get_c_event(event_ptr)?;
+            let event = EpollEvent::from_c(c_event);
+            let flags = EpollFlags::from_c(c_event);
+            EpollCtl::Add(fd, event, flags)
+        }
+        libc::EPOLL_CTL_DEL => EpollCtl::Del(fd),
+        libc::EPOLL_CTL_MOD => {
+            let c_event = get_c_event(event_ptr)?;
+            let event = EpollEvent::from_c(c_event);
+            let flags = EpollFlags::from_c(c_event);
+            EpollCtl::Mod(fd, event, flags)
+        }
+        _ => return_errno!(EINVAL, "invalid op"),
     };
 
     let epfile_ref = current!().file(epfd as FileDesc)?;
-    let epoll_file = epfile_ref.as_epfile()?;
+    let epoll_file = epfile_ref.as_epoll_file()?;
 
-    epoll_file.control(
-        EpollCtlCmd::try_from(op)?,
-        fd as FileDesc,
-        inner_event.as_ref(),
-    )?;
+    epoll_file.control(&ctl_cmd)?;
     Ok(0)
 }
 
@@ -652,8 +683,13 @@ pub fn do_epoll_wait(
     epfd: c_int,
     events: *mut libc::epoll_event,
     max_events: c_int,
-    timeout: c_int,
+    timeout_ms: c_int,
 ) -> Result<isize> {
+    debug!(
+        "epoll_wait: epfd: {}, max_events: {:?}, timeout_ms: {}",
+        epfd, max_events, timeout_ms
+    );
+
     let max_events = {
         if max_events <= 0 {
             return_errno!(EINVAL, "maxevents <= 0");
@@ -666,23 +702,26 @@ pub fn do_epoll_wait(
     };
 
     // A new vector to store EpollEvent, which may degrade the performance due to extra copy.
-    let mut inner_events: Vec<EpollEvent> =
-        vec![EpollEvent::new(EpollEventFlags::empty(), 0); max_events];
+    let mut inner_events: Vec<MaybeUninit<EpollEvent>> = vec![MaybeUninit::uninit(); max_events];
 
     debug!(
         "epoll_wait: epfd: {}, len: {:?}, timeout: {}",
         epfd,
         raw_events.len(),
-        timeout
+        timeout_ms,
     );
 
     let epfile_ref = current!().file(epfd as FileDesc)?;
-    let epoll_file = epfile_ref.as_epfile()?;
-
-    let count = epoll_file.wait(&mut inner_events, timeout)?;
+    let epoll_file = epfile_ref.as_epoll_file()?;
+    let timeout = if timeout_ms >= 0 {
+        Some(Duration::from_millis(timeout_ms as u64))
+    } else {
+        None
+    };
+    let count = epoll_file.wait(&mut inner_events, timeout.as_ref())?;
 
     for i in 0..count {
-        raw_events[i] = inner_events[i].to_raw();
+        raw_events[i] = unsafe { inner_events[i].assume_init() }.to_c();
     }
 
     Ok(count as isize)
@@ -698,7 +737,7 @@ pub fn do_epoll_pwait(
     if !sigmask.is_null() {
         warn!("epoll_pwait cannot handle signal mask, yet");
     } else {
-        info!("epoll_wait");
+        debug!("epoll_wait");
     }
     do_epoll_wait(epfd, events, maxevents, timeout)
 }

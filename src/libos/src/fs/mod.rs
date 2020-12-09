@@ -12,14 +12,15 @@ use untrusted::{SliceAsMutPtrAndLen, SliceAsPtrAndLen};
 
 pub use self::dev_fs::AsDevRandom;
 pub use self::event_file::{AsEvent, EventCreationFlags, EventFile};
-pub use self::events::{IoEvents, IoNotifier};
+pub use self::events::{AtomicIoEvents, IoEvents, IoNotifier};
 pub use self::file::{File, FileRef};
 pub use self::file_ops::{
     occlum_ocall_ioctl, AccessMode, BuiltinIoctlNum, CreationFlags, FileMode, Flock, FlockType,
     IfConf, IoctlCmd, Stat, StatusFlags, StructuredIoctlArgType, StructuredIoctlNum,
 };
-pub use self::file_table::{FileDesc, FileTable};
+pub use self::file_table::{FileDesc, FileTable, FileTableEvent, FileTableNotifier};
 pub use self::fs_view::FsView;
+pub use self::host_fd::HostFd;
 pub use self::inode_file::{AsINodeFile, INodeExt, INodeFile};
 pub use self::pipe::PipeType;
 pub use self::rootfs::ROOT_INODE;
@@ -35,6 +36,7 @@ mod file_ops;
 mod file_table;
 mod fs_ops;
 mod fs_view;
+mod host_fd;
 mod hostfs;
 mod inode_file;
 mod pipe;

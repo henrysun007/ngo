@@ -65,7 +65,7 @@ WORKDIR /tmp
 RUN git clone -b sgx_2.11_for_occlum https://github.com/occlum/linux-sgx && \
     mkdir /etc/init && \
     cd linux-sgx && make preparation && \
-    ./compile_and_install.sh no_mitigation && \
+    ./compile_and_install.sh no_mitigation USE_OPT_LIBS=2 && \
     echo 'source /opt/intel/sgxsdk/environment' >> /root/.bashrc && \
     rm -rf /tmp/linux-sgx
 
@@ -75,7 +75,8 @@ ENV OCCLUM_RUST_VERSION=nightly-2020-09-08
 RUN curl https://sh.rustup.rs -sSf | \
         sh -s -- --default-toolchain ${OCCLUM_RUST_VERSION} -y && \
     rm -rf /root/.cargo/registry && rm -rf /root/.cargo/git && \
-    cargo -V
+    cargo -V && \
+    cargo install sccache
 
 # Install Occlum toolchain
 COPY toolchains/gcc /tmp/gcc
@@ -107,8 +108,9 @@ RUN cd java && ./install_dragonwell.sh && rm -rf /tmp/java
 ENV PATH="/opt/occlum/toolchains/jvm/bin:$PATH"
 
 # Install the latest version of Occlum
+ARG OCCLUM_BRANCH
 WORKDIR /root
-RUN git clone https://github.com/occlum/occlum && \
+RUN git clone -b $OCCLUM_BRANCH https://github.com/occlum/occlum && \
     cd occlum && \
     make submodule && \
     OCCLUM_RELEASE_BUILD=1 make && \
